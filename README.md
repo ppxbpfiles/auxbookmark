@@ -1,5 +1,9 @@
 # auxbookmark - PPx aux: Webブックマーク連携ツール
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-2024%20Edition-orange.svg)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)](#)
+
 **auxbookmark** は、ファイラー「Paper Plane xUI (PPx)」の画面上で Web ブラウザのブックマークをファイルのように扱い、フォルダ分け・移動・複写・削除などの整理を行うためのツールです。  
 PPx の `aux:` パス機能を利用し、Chromium系（Brave, Chrome, Edge など）や Firefox のブックマークを横断して一覧・操作できます（※おまけとして PPxの一行編集でブックマークと履歴検索するための auxbookmark_to_complist.js および Emacs 用の連携スクリプト `auxbookmark.el` も同梱しています）。
 
