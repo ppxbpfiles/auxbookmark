@@ -3,6 +3,8 @@
 **auxbookmark** は、ファイラー「Paper Plane xUI (PPx)」の画面上で Web ブラウザのブックマークをファイルのように扱い、フォルダ分け・移動・複写・削除などの整理を行うためのツールです。  
 PPx の `aux:` パス機能を利用し、Chromium系（Brave, Chrome, Edge など）や Firefox のブックマークを横断して一覧・操作できます（※おまけとして PPxの一行編集でブックマークと履歴検索するための auxbookmark_to_complist.js および Emacs 用の連携スクリプト `auxbookmark.el` も同梱しています）。
 
+<img width="975" height="555" alt="image" src="https://github.com/user-attachments/assets/1e48cffd-4053-4abe-bf2e-e26993dc49d5" />
+
 ---
 
 ## 主な特徴
