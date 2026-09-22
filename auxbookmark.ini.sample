@@ -1,0 +1,23 @@
+; ==============================================================================
+; auxbookmark 設定ファイル
+; ==============================================================================
+
+[general]
+; 自動バックアップの間隔（分単位）
+; 整理セッション開始時の変更直前に1回バックアップ（backups/ フォルダ配下）を作成します。
+; デフォルト: 30
+backup_interval_minutes = 30
+
+; ==============================================================================
+; ブラウザ / プロファイル一覧設定 [profiles]
+; 未指定の場合は Brave / Chrome / Edge / Firefox 等のデフォルトプロファイルが自動検出されます。
+; 特定のプロファイルを追加・固定したい場合は以下のコメントを外して設定してください。
+; ※ .sqlite または places.sqlite を指定した場合は Firefox / Gecko 互換ブラウザとして扱われます。
+; ==============================================================================
+[profiles]
+; Brave = C:\Users\your_user\AppData\Local\BraveSoftware\Brave-Browser\User Data\Default\Bookmarks
+; Chrome = C:\Users\your_user\AppData\Local\Google\Chrome\User Data\Default\Bookmarks
+; Edge = C:\Users\your_user\AppData\Local\Microsoft\Edge\User Data\Default\Bookmarks
+; Work = C:\Users\your_user\AppData\Local\Google\Chrome\User Data\Profile 1\Bookmarks
+; Firefox = C:\Users\your_user\AppData\Roaming\Mozilla\Firefox\Profiles\xxxx.default-release\places.sqlite
+; GeckoCompat = C:\path\to\your\custom_profile\places.sqlite
