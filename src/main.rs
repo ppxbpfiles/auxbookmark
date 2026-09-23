@@ -12,6 +12,7 @@
 //!   copy    <src_path>     <dest_path>
 //!   rename  <src_path>     <dest_path>
 
+use std::collections::HashMap;
 use std::env;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs::{self, File, OpenOptions};
@@ -29,6 +30,7 @@ use serde_json::{json, Value};
 
 const TRASH_FOLDER_NAME: &str = "ゴミ箱";
 const ISOLATE_FOLDER_NAME: &str = "リンク切れ";
+const DUP_FOLDER_NAME: &str = "重複";
 const HISTORY_FOLDER_NAME: &str = "履歴";
 const BOOKMARK_BAR_JP: &str = "ブックマーク バー";
 const OTHER_BOOKMARKS_JP: &str = "その他のブックマーク";
@@ -1229,6 +1231,34 @@ fn ensure_isolate_folder(val: &mut Value) {
     }
 }
 
+/// 重複フォルダが存在しない場合は作成する
+fn ensure_dup_folder(val: &mut Value) {
+    let has_dup = if let Some(other) = val.get("roots").and_then(|r| r.get("other")).and_then(|o| o.get("children")).and_then(|c| c.as_array()) {
+        other.iter().any(|child| {
+            child.get("type").and_then(|t| t.as_str()) == Some("folder")
+                && child.get("name").and_then(|n| n.as_str()) == Some(DUP_FOLDER_NAME)
+        })
+    } else {
+        false
+    };
+
+    if !has_dup {
+        let max_id = find_max_id(val);
+        if let Some(other_children) = val.get_mut("roots").and_then(|r| r.get_mut("other")).and_then(|o| o.get_mut("children")).and_then(|c| c.as_array_mut()) {
+            other_children.push(json!({
+                "date_added": now_chromium_time(),
+                "date_last_used": "0",
+                "date_modified": now_chromium_time(),
+                "guid": generate_guid(),
+                "id": (max_id + 1).to_string(),
+                "name": DUP_FOLDER_NAME,
+                "type": "folder",
+                "children": []
+            }));
+        }
+    }
+}
+
 fn get_root_node_mut<'a>(val: &'a mut Value, segment: &str) -> Option<&'a mut Value> {
     if segment == "trash" || segment == TRASH_FOLDER_NAME {
         ensure_trash_folder(val);
@@ -1247,6 +1277,16 @@ fn get_root_node_mut<'a>(val: &'a mut Value, segment: &str) -> Option<&'a mut Va
         let idx = children.iter().position(|child| {
             child.get("type").and_then(|t| t.as_str()) == Some("folder")
                 && child.get("name").and_then(|n| n.as_str()) == Some(ISOLATE_FOLDER_NAME)
+        })?;
+        return children.get_mut(idx);
+    }
+    if segment == "dup" || segment == DUP_FOLDER_NAME {
+        ensure_dup_folder(val);
+        let other = val.get_mut("roots")?.get_mut("other")?;
+        let children = other.get_mut("children")?.as_array_mut()?;
+        let idx = children.iter().position(|child| {
+            child.get("type").and_then(|t| t.as_str()) == Some("folder")
+                && child.get("name").and_then(|n| n.as_str()) == Some(DUP_FOLDER_NAME)
         })?;
         return children.get_mut(idx);
     }
@@ -1292,6 +1332,14 @@ fn get_root_node_ref<'a>(val: &'a Value, segment: &str) -> Option<&'a Value> {
         return children.iter().find(|child| {
             child.get("type").and_then(|t| t.as_str()) == Some(ISOLATE_FOLDER_NAME)
                 || child.get("name").and_then(|n| n.as_str()) == Some(ISOLATE_FOLDER_NAME)
+        });
+    }
+    if segment == "dup" || segment == DUP_FOLDER_NAME {
+        let other = roots.get("other")?;
+        let children = other.get("children")?.as_array()?;
+        return children.iter().find(|child| {
+            child.get("type").and_then(|t| t.as_str()) == Some(DUP_FOLDER_NAME)
+                || child.get("name").and_then(|n| n.as_str()) == Some(DUP_FOLDER_NAME)
         });
     }
     if segment == "history" || segment == HISTORY_FOLDER_NAME {
@@ -1846,12 +1894,16 @@ fn cmd_copy(config: &Config, src_path: &str, dest_path: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("Source node not found: {}", src_path))?
         .clone();
 
-    maybe_backup(dest_prof, config.backup_interval_minutes, config.backup_keep_generations)?;
     let mut dest_val = if is_same_profile {
         src_val
     } else {
         read_profile_bookmarks(dest_prof)?
     };
+
+    let src_sub = &src_segs[1..];
+    let src_parent = if src_sub.len() > 1 { &src_sub[..src_sub.len() - 1] } else { &[] };
+    let src_raw_title = src_node.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let src_type = src_node.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     let mut dest_sub = dest_segs[1..].to_vec();
     let dest_is_folder = {
@@ -1862,15 +1914,33 @@ fn cmd_copy(config: &Config, src_path: &str, dest_path: &str) -> Result<()> {
         }
     };
 
-    if !dest_is_folder && dest_sub.len() > 1 {
-        dest_sub.pop();
+    let target_title = if !dest_is_folder && dest_sub.len() > 1 {
+        let raw = dest_sub.pop().unwrap();
+        if src_type == "url" {
+            raw.strip_suffix(".url").unwrap_or(&raw).to_string()
+        } else {
+            raw
+        }
+    } else {
+        src_raw_title.to_string()
+    };
+
+    // 同一フォルダかつタイトルとURL両方が一致する場合にのみ中止
+    if is_same_profile && src_parent == dest_sub.as_slice() && src_raw_title == target_title {
+        return Err(anyhow!(
+            "Cannot copy: an identical bookmark (same folder, title, and URL) already exists: {}",
+            src_path
+        ));
     }
+
+    maybe_backup(dest_prof, config.backup_interval_minutes, config.backup_keep_generations)?;
 
     let max_id = find_max_id(&dest_val);
     let mut cloned_node = src_node;
     if let Some(obj) = cloned_node.as_object_mut() {
         obj.insert("id".to_string(), json!((max_id + 1).to_string()));
         obj.insert("guid".to_string(), json!(generate_guid()));
+        obj.insert("name".to_string(), json!(target_title));
         obj.insert("date_added".to_string(), json!(now_chromium_time()));
         obj.insert("date_modified".to_string(), json!(now_chromium_time()));
     }
@@ -1985,7 +2055,6 @@ fn cmd_rename(config: &Config, src_path: &str, dest_path: &str) -> Result<()> {
         return Err(anyhow!("New name cannot be empty"));
     }
 
-    maybe_backup(src_prof, config.backup_interval_minutes, config.backup_keep_generations)?;
     let mut val = read_profile_bookmarks(src_prof)?;
 
     let src_sub = &src_segs[1..];
@@ -1995,20 +2064,45 @@ fn cmd_rename(config: &Config, src_path: &str, dest_path: &str) -> Result<()> {
 
     let old_display = get_node_display_name(target_node);
     let n_type = target_node.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    let new_title = if n_type == "url" {
-        new_raw_name.strip_suffix(".url").unwrap_or(new_raw_name)
+    let old_title = target_node.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let old_url = target_node.get("url").and_then(|v| v.as_str()).unwrap_or("");
+
+    let is_url_input = n_type == "url"
+        && (new_raw_name.starts_with("http://") || new_raw_name.starts_with("https://"));
+
+    if is_url_input {
+        let new_url = new_raw_name.trim();
+        if new_url == old_url {
+            return Err(anyhow!("Cannot rename: URL is identical (no change)"));
+        }
+        maybe_backup(src_prof, config.backup_interval_minutes, config.backup_keep_generations)?;
+        target_node["url"] = json!(new_url);
+        let now_micros = now_chromium_time();
+        if target_node.get("date_modified").is_some() {
+            target_node["date_modified"] = json!(now_micros);
+        }
+        write_profile_bookmarks(src_prof, &val)?;
+        log_msg(&format!("[{}] Updated URL: {} -> {}", src_prof.name, old_display, new_url));
     } else {
-        new_raw_name.as_str()
-    };
+        let new_title = if n_type == "url" {
+            new_raw_name.strip_suffix(".url").unwrap_or(new_raw_name)
+        } else {
+            new_raw_name.as_str()
+        };
 
-    target_node["name"] = json!(new_title);
-    let now_micros = now_chromium_time();
-    if target_node.get("date_modified").is_some() {
-        target_node["date_modified"] = json!(now_micros);
+        if new_title == old_title {
+            return Err(anyhow!("Cannot rename: title is identical (no change)"));
+        }
+
+        maybe_backup(src_prof, config.backup_interval_minutes, config.backup_keep_generations)?;
+        target_node["name"] = json!(new_title);
+        let now_micros = now_chromium_time();
+        if target_node.get("date_modified").is_some() {
+            target_node["date_modified"] = json!(now_micros);
+        }
+        write_profile_bookmarks(src_prof, &val)?;
+        log_msg(&format!("[{}] Renamed: {} -> {}", src_prof.name, old_display, new_title));
     }
-
-    write_profile_bookmarks(src_prof, &val)?;
-    log_msg(&format!("[{}] Renamed: {} -> {}", src_prof.name, old_display, new_title));
     Ok(())
 }
 
@@ -2102,8 +2196,8 @@ fn collect_link_items(node: &Value, current_path: &[String], out: &mut Vec<LinkI
     let n_type = node.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
-    // ゴミ箱やリンク切れフォルダ内のアイテムはスキップ
-    if n_type == "folder" && (name == TRASH_FOLDER_NAME || name == ISOLATE_FOLDER_NAME) {
+    // ゴミ箱やリンク切れ、重複フォルダ内のアイテムはスキップ
+    if n_type == "folder" && (name == TRASH_FOLDER_NAME || name == ISOLATE_FOLDER_NAME || name == DUP_FOLDER_NAME) {
         return;
     }
 
@@ -2373,8 +2467,8 @@ fn dump_node_tsv<W: Write>(
     let n_type = node.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
-    // ゴミ箱やリンク切れフォルダは除外
-    if n_type == "folder" && (name == TRASH_FOLDER_NAME || name == ISOLATE_FOLDER_NAME || name.eq_ignore_ascii_case("trash")) {
+    // ゴミ箱やリンク切れ、重複フォルダは除外
+    if n_type == "folder" && (name == TRASH_FOLDER_NAME || name == ISOLATE_FOLDER_NAME || name == DUP_FOLDER_NAME || name.eq_ignore_ascii_case("trash")) {
         return Ok(());
     }
 
@@ -2442,8 +2536,236 @@ fn cmd_dump(config: &Config, target_prof: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+// ==============================================================================
+// 重複チェック機能
+// ==============================================================================
+
+fn normalize_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if let Some(idx) = trimmed.find("://") {
+        let scheme = &trimmed[..idx].to_ascii_lowercase();
+        let rest = &trimmed[idx + 3..];
+        let (host, path_and_query) = match rest.find('/') {
+            Some(slash_idx) => (&rest[..slash_idx], &rest[slash_idx..]),
+            None => (rest, ""),
+        };
+        let host_lower = host.to_ascii_lowercase();
+        let mut norm_path = path_and_query.to_string();
+        if norm_path.ends_with('/') {
+            norm_path.pop();
+        }
+        format!("{}://{}{}", scheme, host_lower, norm_path)
+    } else {
+        trimmed.trim_end_matches('/').to_string()
+    }
+}
+
+fn remove_target_node(
+    val: &mut Value,
+    segments: &[String],
+    target_url: &str,
+) -> Result<Value> {
+    if segments.len() < 2 {
+        return Err(anyhow!("Cannot remove root: {:?}", segments));
+    }
+    let parent_segs = &segments[..segments.len() - 1];
+    let target_name = &segments[segments.len() - 1];
+
+    let mut current = get_root_node_mut(val, &parent_segs[0])
+        .ok_or_else(|| anyhow!("Root segment not found: {}", parent_segs[0]))?;
+
+    for seg in &parent_segs[1..] {
+        let children = current.get_mut("children")
+            .and_then(|c| c.as_array_mut())
+            .ok_or_else(|| anyhow!("Path segment is not a folder: {}", seg))?;
+
+        let idx = children.iter().position(|child| {
+            get_node_display_name(child) == *seg
+        }).ok_or_else(|| anyhow!("Child folder not found: {}", seg))?;
+
+        current = children.get_mut(idx).unwrap();
+    }
+
+    let children = current.get_mut("children")
+        .and_then(|c| c.as_array_mut())
+        .ok_or_else(|| anyhow!("Parent node has no children array"))?;
+
+    let idx = children.iter().position(|child| {
+        let url_matches = child.get("url").and_then(|u| u.as_str()) == Some(target_url);
+        let name_matches = get_node_display_name(child) == *target_name;
+        url_matches && name_matches
+    }).or_else(|| {
+        children.iter().position(|child| {
+            get_node_display_name(child) == *target_name
+        })
+    }).ok_or_else(|| anyhow!("Target bookmark not found: {} ({})", target_name, target_url))?;
+
+    Ok(children.remove(idx))
+}
+
+fn cmd_dedup(
+    config: &Config,
+    target_prof_or_path: &str,
+    to_trash: bool,
+    to_isolate: bool,
+) -> Result<()> {
+    let segments = parse_virtual_segments(target_prof_or_path);
+    let prof_name = if !segments.is_empty() {
+        &segments[0]
+    } else if !target_prof_or_path.trim().is_empty() {
+        target_prof_or_path.trim()
+    } else if !config.profiles.is_empty() {
+        &config.profiles[0].name
+    } else {
+        return Err(anyhow!("No browser profile specified for duplicate check."));
+    };
+
+    let prof = find_profile(config, prof_name)
+        .ok_or_else(|| anyhow!("Browser profile '{}' not found", prof_name))?;
+
+    let val = read_profile_bookmarks(prof)?;
+    let sub_segs = if segments.len() > 1 { &segments[1..] } else { &[] };
+
+    let mut targets = Vec::new();
+
+    if sub_segs.is_empty() {
+        if let Some(roots) = val.get("roots") {
+            if let Some(bar) = roots.get("bookmark_bar") {
+                collect_link_items(bar, &[BOOKMARK_BAR_JP.to_string()], &mut targets);
+            }
+            if let Some(other) = roots.get("other") {
+                collect_link_items(other, &[OTHER_BOOKMARKS_JP.to_string()], &mut targets);
+            }
+            if let Some(menu) = roots.get("menu") {
+                collect_link_items(menu, &[BOOKMARK_MENU_JP.to_string()], &mut targets);
+            }
+        }
+    } else {
+        let node = navigate_node_ref(&val, sub_segs)
+            .ok_or_else(|| anyhow!("Target path not found: {}", target_prof_or_path))?;
+        collect_link_items(node, sub_segs, &mut targets);
+    }
+
+    let total_count = targets.len();
+    if total_count == 0 {
+        println!("No Web URL bookmarks found to check.");
+        return Ok(());
+    }
+
+    let mut order = Vec::new();
+    let mut groups: HashMap<String, Vec<LinkItem>> = HashMap::new();
+
+    for item in targets {
+        let norm = normalize_url(&item.url);
+        if let Some(list) = groups.get_mut(&norm) {
+            list.push(item);
+        } else {
+            groups.insert(norm.clone(), vec![item]);
+            order.push(norm);
+        }
+    }
+
+    let mut dup_groups = Vec::new();
+    let mut dup_items = Vec::new();
+
+    for key in &order {
+        if let Some(items) = groups.get(key) {
+            if items.len() > 1 {
+                dup_groups.push(items);
+                for item in &items[1..] {
+                    dup_items.push(item.clone());
+                }
+            }
+        }
+    }
+
+    println!("===================================================");
+    println!("  auxbookmark Duplicate Check: [{}] ({} items scanned)", prof.name, total_count);
+    let mode_desc = if to_trash {
+        "Move duplicate items to Trash"
+    } else if to_isolate {
+        "Move duplicate items to '重複' folder"
+    } else {
+        "Report only (dry-run)"
+    };
+    println!("  Mode   : {}", mode_desc);
+    println!("===================================================");
+
+    if dup_groups.is_empty() {
+        println!("No duplicate bookmarks found.");
+        println!("===================================================");
+        return Ok(());
+    }
+
+    for (idx, group) in dup_groups.iter().enumerate() {
+        let keep = &group[0];
+        let keep_path = keep.path_segments.join("/");
+        println!("[DUP #{}] URL: {}", idx + 1, keep.url);
+        println!("  Keep   : {} ({})", keep_path, keep.name);
+        for (d_idx, dup) in group[1..].iter().enumerate() {
+            let dup_path = dup.path_segments.join("/");
+            println!("  Dup #{}: {} ({})", d_idx + 1, dup_path, dup.name);
+        }
+        println!();
+    }
+
+    println!("===================================================");
+    println!("Duplicate Check Summary: {} items scanned", total_count);
+    println!("  - Unique URLs     : {}", order.len());
+    println!("  - Duplicate Groups: {}", dup_groups.len());
+    println!("  - Duplicate Items : {}", dup_items.len());
+    println!("===================================================");
+
+    if (to_trash || to_isolate) && !dup_items.is_empty() {
+        maybe_backup(prof, 0, config.backup_keep_generations)?;
+        let mut write_val = read_profile_bookmarks(prof)?;
+        let mut moved_count = 0;
+
+        for dup in &dup_items {
+            if to_trash {
+                match remove_target_node(&mut write_val, &dup.path_segments, &dup.url) {
+                    Ok(removed) => {
+                        ensure_trash_folder(&mut write_val);
+                        if let Some(trash_node) = get_root_node_mut(&mut write_val, "trash") {
+                            if let Some(trash_children) = trash_node.get_mut("children").and_then(|c| c.as_array_mut()) {
+                                trash_children.push(removed);
+                                moved_count += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log_msg(&format!("[{}] Failed to remove dup item {:?}: {:#}", prof.name, dup.path_segments, e));
+                    }
+                }
+            } else if to_isolate {
+                ensure_dup_folder(&mut write_val);
+                match remove_target_node(&mut write_val, &dup.path_segments, &dup.url) {
+                    Ok(removed) => {
+                        if let Some(dup_node) = get_root_node_mut(&mut write_val, DUP_FOLDER_NAME) {
+                            if let Some(dup_children) = dup_node.get_mut("children").and_then(|c| c.as_array_mut()) {
+                                dup_children.push(removed);
+                                moved_count += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log_msg(&format!("[{}] Failed to isolate dup item {:?}: {:#}", prof.name, dup.path_segments, e));
+                    }
+                }
+            }
+        }
+
+        write_profile_bookmarks(prof, &write_val)?;
+        let target_dest_name = if to_trash { TRASH_FOLDER_NAME } else { DUP_FOLDER_NAME };
+        println!("Successfully moved {} duplicate bookmark(s) to '{}'.", moved_count, target_dest_name);
+        log_msg(&format!("[{}] Duplicate check: moved {} items to '{}'", prof.name, moved_count, target_dest_name));
+    }
+
+    Ok(())
+}
+
 fn print_help() {
-    println!("auxbookmark v0.2.0 - PPx aux: path Web Bookmark bridge");
+    println!("auxbookmark v0.3.0 - PPx aux: path Web Bookmark bridge");
     println!("A lightweight CLI bridge between Paper Plane xUI (PPx) aux: path and Chromium & Firefox Web Bookmarks.");
     println!();
     println!("Copyright (c) 2026 auxbookmark contributors");
@@ -2479,6 +2801,11 @@ fn print_help() {
     println!("          --isolate: Move dead bookmarks to 'リンク切れ' folder.");
     println!("          --timeout: Connection timeout in seconds (default: 5).");
     println!("          --threads: Concurrency level (default: 8).");
+    println!("  dedup   <profile_or_path> [--trash | --isolate]");
+    println!("          Check duplicate bookmarks by normalized URL.");
+    println!("          Default: Report only (dry-run).");
+    println!("          --trash:   Move duplicate bookmarks to Trash.");
+    println!("          --isolate: Move duplicate bookmarks to '重複' folder.");
     println!("  dump    [profile_name]");
     println!("          Dump all bookmarks as TSV (title\\turl\\tbrowser\\tpath) for Emacs/CLI.");
     println!();
@@ -2643,6 +2970,23 @@ fn main() {
             }
 
             cmd_check(&config, target, to_trash, to_isolate, timeout_secs, threads)
+        }
+        "dedup" | "dup" => {
+            let mut target = "";
+            let mut to_trash = false;
+            let mut to_isolate = false;
+
+            for arg in &args[2..] {
+                if is_opt(arg, &["trash"]) {
+                    to_trash = true;
+                } else if is_opt(arg, &["isolate"]) {
+                    to_isolate = true;
+                } else if target.is_empty() {
+                    target = arg.as_str();
+                }
+            }
+
+            cmd_dedup(&config, target, to_trash, to_isolate)
         }
         "dump" => {
             let target = args.get(2).map(|s| s.as_str());
